@@ -215,3 +215,23 @@ func TestResourcesEndpoint_List_Node(t *testing.T) {
 
 	assert.Equal(t, resp.Truncations["node"], false)
 }
+
+func TestResourcesEndpoint_List_InvalidContext(t *testing.T) {
+	t.Parallel()
+	s := testServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+	})
+
+	defer s.Shutdown()
+	codec := rpcClient(t, s)
+	testutil.WaitForLeader(t, s.RPC)
+
+	req := &structs.ResourcesRequest{
+		Prefix:  "anyPrefix",
+		Context: "invalid",
+	}
+
+	var resp structs.ResourcesResponse
+	err := msgpackrpc.CallWithCodec(codec, "Resources.List", req, &resp)
+	assert.Equal(t, err.Error(), "invalid context")
+}
