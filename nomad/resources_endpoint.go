@@ -28,6 +28,8 @@ func getMatches(iter memdb.ResultIterator, context, prefix string) ([]string, bo
 				return i.(*structs.Evaluation).ID
 			case *structs.Allocation:
 				return i.(*structs.Allocation).ID
+			case *structs.Node:
+				return i.(*structs.Node).ID
 			default:
 				return ""
 			}
@@ -73,6 +75,8 @@ func (r *Resources) List(args *structs.ResourcesRequest,
 				iter, err = state.EvalsByIDPrefix(ws, args.Prefix)
 			} else if args.Context == "alloc" {
 				iter, err = state.AllocsByIDPrefix(ws, args.Prefix)
+			} else if args.Context == "node" {
+				iter, err = state.NodesByIDPrefix(ws, args.Prefix)
 			}
 
 			if err != nil {
