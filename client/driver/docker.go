@@ -976,9 +976,10 @@ func (d *DockerDriver) createContainerConfig(ctx *ExecContext, task *structs.Tas
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
-			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
-			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
-			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (static)", network.IP, port.Value, port.Value)
+			// Bind on all interfaces: https://github.com/hashicorp/nomad/issues/2726
+			publishedPorts[containerPort+"/tcp"] = getPortBinding("0.0.0.0", hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding("0.0.0.0", hostPortStr)
+			d.logger.Printf("[DEBUG] driver.docker: allocated port 0.0.0.0:%d -> %d (static)", port.Value, port.Value)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
 			exposedPorts[containerPort+"/udp"] = struct{}{}
@@ -997,9 +998,10 @@ func (d *DockerDriver) createContainerConfig(ctx *ExecContext, task *structs.Tas
 			hostPortStr := strconv.Itoa(port.Value)
 			containerPort := docker.Port(strconv.Itoa(containerPortInt))
 
-			publishedPorts[containerPort+"/tcp"] = getPortBinding(network.IP, hostPortStr)
-			publishedPorts[containerPort+"/udp"] = getPortBinding(network.IP, hostPortStr)
-			d.logger.Printf("[DEBUG] driver.docker: allocated port %s:%d -> %d (mapped)", network.IP, port.Value, containerPortInt)
+			// Bind on all interfaces: https://github.com/hashicorp/nomad/issues/2726
+			publishedPorts[containerPort+"/tcp"] = getPortBinding("0.0.0.0", hostPortStr)
+			publishedPorts[containerPort+"/udp"] = getPortBinding("0.0.0.0", hostPortStr)
+			d.logger.Printf("[DEBUG] driver.docker: allocated port 0.0.0.0:%d -> %d (mapped)", port.Value, containerPortInt)
 
 			exposedPorts[containerPort+"/tcp"] = struct{}{}
 			exposedPorts[containerPort+"/udp"] = struct{}{}
