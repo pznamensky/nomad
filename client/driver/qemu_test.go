@@ -1,15 +1,20 @@
 package driver
 
 import (
+	"bytes"
 	"fmt"
-	"os"
+	"net"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/consul/lib/freeport"
 	"github.com/hashicorp/nomad/client/config"
+	cstructs "github.com/hashicorp/nomad/client/structs"
+	"github.com/hashicorp/nomad/helper/testlog"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
 
@@ -28,29 +33,40 @@ func TestQemuDriver_Fingerprint(t *testing.T) {
 		Resources: structs.DefaultResources(),
 	}
 	ctx := testDriverContexts(t, task)
-	defer ctx.AllocDir.Destroy()
+	defer ctx.Destroy()
 	d := NewQemuDriver(ctx.DriverCtx)
 
 	node := &structs.Node{
 		Attributes: make(map[string]string),
 	}
-	apply, err := d.Fingerprint(&config.Config{}, node)
+
+	request := &cstructs.FingerprintRequest{Config: &config.Config{}, Node: node}
+	var response cstructs.FingerprintResponse
+	err := d.Fingerprint(request, &response)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if !apply {
-		t.Fatalf("should apply")
+
+	if !response.Detected {
+		t.Fatalf("expected response to be applicable")
 	}
-	if node.Attributes[qemuDriverAttr] == "" {
+
+	attributes := response.Attributes
+	if attributes == nil {
+		t.Fatalf("attributes should not be nil")
+	}
+
+	if attributes[qemuDriverAttr] == "" {
 		t.Fatalf("Missing Qemu driver")
 	}
-	if node.Attributes[qemuDriverVersionAttr] == "" {
+
+	if attributes[qemuDriverVersionAttr] == "" {
 		t.Fatalf("Missing Qemu driver version")
 	}
 }
 
 func TestQemuDriver_StartOpen_Wait(t *testing.T) {
-	logger := testLogger()
+	logger := testlog.Logger(t)
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
@@ -84,7 +100,7 @@ func TestQemuDriver_StartOpen_Wait(t *testing.T) {
 	}
 
 	ctx := testDriverContexts(t, task)
-	defer ctx.AllocDir.Destroy()
+	defer ctx.Destroy()
 	d := NewQemuDriver(ctx.DriverCtx)
 
 	// Copy the test image into the task's directory
@@ -122,58 +138,66 @@ func TestQemuDriver_StartOpen_Wait(t *testing.T) {
 }
 
 func TestQemuDriver_GracefulShutdown(t *testing.T) {
-	logger := testLogger()
+	testutil.SkipSlow(t)
 	if !testutil.IsTravis() {
 		t.Parallel()
 	}
 	ctestutils.QemuCompatible(t)
+
+	logger := testlog.Logger(t)
+
+	// Graceful shutdown may be really slow unfortunately
+	killTimeout := 3 * time.Minute
+
+	// Grab a free port so we can tell when the image has started
+	port := freeport.GetT(t, 1)[0]
+
 	task := &structs.Task{
-		Name:   "linux",
+		Name:   "alpine-shutdown-test",
 		Driver: "qemu",
 		Config: map[string]interface{}{
-			"image_path":        "linux-0.2.img",
-			"accelerator":       "tcg",
+			"image_path":        "alpine.qcow2",
 			"graceful_shutdown": true,
+			"args":              []string{"-nodefconfig", "-nodefaults"},
 			"port_map": []map[string]int{{
-				"main": 22,
-				"web":  8080,
+				"ssh": 22,
 			}},
-			"args": []string{"-nodefconfig", "-nodefaults"},
 		},
-		// With the use of tcg acceleration, it's very unlikely a qemu instance
-		// will boot (and gracefully halt) in a reasonable amount of time, so
-		// this timeout is kept low to reduce test execution time.
-		KillTimeout: time.Duration(1 * time.Second),
 		LogConfig: &structs.LogConfig{
 			MaxFiles:      10,
 			MaxFileSizeMB: 10,
 		},
 		Resources: &structs.Resources{
-			CPU:      500,
-			MemoryMB: 512,
+			CPU:      1000,
+			MemoryMB: 256,
 			Networks: []*structs.NetworkResource{
 				{
-					ReservedPorts: []structs.Port{{Label: "main", Value: 22000}, {Label: "web", Value: 80}},
+					ReservedPorts: []structs.Port{{Label: "ssh", Value: port}},
 				},
 			},
 		},
+		KillTimeout: killTimeout,
 	}
 
 	ctx := testDriverContexts(t, task)
-	defer ctx.AllocDir.Destroy()
+	ctx.DriverCtx.config.MaxKillTimeout = killTimeout
+	defer ctx.Destroy()
 	d := NewQemuDriver(ctx.DriverCtx)
 
-	apply, err := d.Fingerprint(&config.Config{}, ctx.DriverCtx.node)
+	request := &cstructs.FingerprintRequest{Config: &config.Config{}, Node: ctx.DriverCtx.node}
+	var response cstructs.FingerprintResponse
+	err := d.Fingerprint(request, &response)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if !apply {
-		t.Fatalf("should apply")
+
+	for name, value := range response.Attributes {
+		ctx.DriverCtx.node.Attributes[name] = value
 	}
 
 	dst := ctx.ExecCtx.TaskDir.Dir
 
-	copyFile("./test-resources/qemu/linux-0.2.img", filepath.Join(dst, "linux-0.2.img"), t)
+	copyFile("./test-resources/qemu/alpine.qcow2", filepath.Join(dst, "alpine.qcow2"), t)
 
 	if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
 		t.Fatalf("Prestart failed: %v", err)
@@ -186,26 +210,46 @@ func TestQemuDriver_GracefulShutdown(t *testing.T) {
 
 	// Clean up
 	defer func() {
+		select {
+		case <-resp.Handle.WaitCh():
+			// Already exited
+			return
+		default:
+		}
+
 		if err := resp.Handle.Kill(); err != nil {
-			logger.Printf("Error killing Qemu test: %s", err)
+			logger.Printf("[TEST] Error killing Qemu test: %s", err)
 		}
 	}()
 
-	// The monitor socket will not exist immediately, so we'll wait up to
-	// 5 seconds for it to become available.
-	monitorPath := fmt.Sprintf("%s/linux/%s", ctx.AllocDir.AllocDir, qemuMonitorSocketName)
-	monitorPathExists := false
-	for i := 0; i < 100; i++ {
-		if _, err := os.Stat(monitorPath); !os.IsNotExist(err) {
-			logger.Printf("monitor socket exists at %q\n", monitorPath)
-			monitorPathExists = true
-			break
+	// Wait until sshd starts before attempting to do a graceful shutdown
+	testutil.WaitForResult(func() (bool, error) {
+		conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			return false, err
 		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if monitorPathExists == false {
-		t.Fatalf("monitor socket did not exist after waiting 20 seconds")
-	}
+
+		// Since the connection will be accepted by the QEMU process
+		// before sshd actually starts, we need to block until we can
+		// read the "SSH" magic bytes
+		header := make([]byte, 3)
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, err = conn.Read(header)
+		if err != nil {
+			return false, err
+		}
+		if !bytes.Equal(header, []byte{'S', 'S', 'H'}) {
+			return false, fmt.Errorf("expected 'SSH' but received: %q %v", string(header), header)
+		}
+
+		logger.Printf("[TEST] connected to sshd in VM")
+		conn.Close()
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("failed to connect to sshd in VM: %v", err)
+	})
+
+	monitorPath := filepath.Join(ctx.AllocDir.AllocDir, task.Name, qemuMonitorSocketName)
 
 	// userPid supplied in sendQemuShutdown calls is bogus (it's used only
 	// for log output)
@@ -219,6 +263,13 @@ func TestQemuDriver_GracefulShutdown(t *testing.T) {
 
 	if err := sendQemuShutdown(ctx.DriverCtx.logger, monitorPath, 0); err != nil {
 		t.Fatalf("unexpected error from sendQemuShutdown: %s", err)
+	}
+
+	select {
+	case <-resp.Handle.WaitCh():
+		logger.Printf("[TEST] VM exited gracefully as expected")
+	case <-time.After(killTimeout):
+		t.Fatalf("VM did not exit gracefully exit before timeout: %s", killTimeout)
 	}
 }
 
@@ -289,7 +340,7 @@ func TestQemuDriverUser(t *testing.T) {
 
 	for _, task := range tasks {
 		ctx := testDriverContexts(t, task)
-		defer ctx.AllocDir.Destroy()
+		defer ctx.Destroy()
 		d := NewQemuDriver(ctx.DriverCtx)
 
 		if _, err := d.Prestart(ctx.ExecCtx, task); err != nil {
@@ -340,7 +391,7 @@ func TestQemuDriverGetMonitorPathOldQemu(t *testing.T) {
 	}
 
 	ctx := testDriverContexts(t, task)
-	defer ctx.AllocDir.Destroy()
+	defer ctx.Destroy()
 
 	// Simulate an older version of qemu which does not support long monitor socket paths
 	ctx.DriverCtx.node.Attributes[qemuDriverVersionAttr] = "2.0.0"
@@ -399,7 +450,7 @@ func TestQemuDriverGetMonitorPathNewQemu(t *testing.T) {
 	}
 
 	ctx := testDriverContexts(t, task)
-	defer ctx.AllocDir.Destroy()
+	defer ctx.Destroy()
 
 	// Simulate a version of qemu which supports long monitor socket paths
 	ctx.DriverCtx.node.Attributes[qemuDriverVersionAttr] = "2.99.99"

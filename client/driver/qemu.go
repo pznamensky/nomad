@@ -17,7 +17,6 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	plugin "github.com/hashicorp/go-plugin"
-	"github.com/hashicorp/nomad/client/config"
 	"github.com/hashicorp/nomad/client/driver/executor"
 	dstructs "github.com/hashicorp/nomad/client/driver/structs"
 	"github.com/hashicorp/nomad/client/fingerprint"
@@ -76,6 +75,7 @@ type qemuHandle struct {
 	userPid        int
 	executor       executor.Executor
 	monitorPath    string
+	shutdownSignal string
 	killTimeout    time.Duration
 	maxKillTimeout time.Duration
 	logger         *log.Logger
@@ -155,7 +155,7 @@ func (d *QemuDriver) FSIsolation() cstructs.FSIsolation {
 	return cstructs.FSIsolationImage
 }
 
-func (d *QemuDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, error) {
+func (d *QemuDriver) Fingerprint(req *cstructs.FingerprintRequest, resp *cstructs.FingerprintResponse) error {
 	bin := "qemu-system-x86_64"
 	if runtime.GOOS == "windows" {
 		// On windows, the "qemu-system-x86_64" command does not respond to the
@@ -164,22 +164,24 @@ func (d *QemuDriver) Fingerprint(cfg *config.Config, node *structs.Node) (bool, 
 	}
 	outBytes, err := exec.Command(bin, "--version").Output()
 	if err != nil {
-		delete(node.Attributes, qemuDriverAttr)
-		return false, nil
+		// return no error, as it isn't an error to not find qemu, it just means we
+		// can't use it.
+		return nil
 	}
 	out := strings.TrimSpace(string(outBytes))
 
 	matches := reQemuVersion.FindStringSubmatch(out)
 	if len(matches) != 2 {
-		delete(node.Attributes, qemuDriverAttr)
-		return false, fmt.Errorf("Unable to parse Qemu version string: %#v", matches)
+		resp.RemoveAttribute(qemuDriverAttr)
+		return fmt.Errorf("Unable to parse Qemu version string: %#v", matches)
 	}
 	currentQemuVersion := matches[1]
 
-	node.Attributes[qemuDriverAttr] = "1"
-	node.Attributes[qemuDriverVersionAttr] = currentQemuVersion
+	resp.AddAttribute(qemuDriverAttr, "1")
+	resp.AddAttribute(qemuDriverVersionAttr, currentQemuVersion)
+	resp.Detected = true
 
-	return true, nil
+	return nil
 }
 
 func (d *QemuDriver) Prestart(_ *ExecContext, task *structs.Task) (*PrestartResponse, error) {
@@ -246,7 +248,7 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse
 		}
 		// This socket will be used to manage the virtual machine (for example,
 		// to perform graceful shutdowns)
-		monitorPath, err := d.getMonitorPath(ctx.TaskDir.Dir)
+		monitorPath, err = d.getMonitorPath(ctx.TaskDir.Dir)
 		if err != nil {
 			d.logger.Printf("[ERR] driver.qemu: could not get qemu monitor path: %s", err)
 			return nil, err
@@ -318,24 +320,22 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse
 	if err != nil {
 		return nil, err
 	}
-	executorCtx := &executor.ExecutorContext{
-		TaskEnv: ctx.TaskEnv,
-		Driver:  "qemu",
-		Task:    task,
-		TaskDir: ctx.TaskDir.Dir,
-		LogDir:  ctx.TaskDir.LogDir,
-	}
-	if err := exec.SetContext(executorCtx); err != nil {
-		pluginClient.Kill()
-		return nil, fmt.Errorf("failed to set executor context: %v", err)
+
+	_, err = getTaskKillSignal(task.KillSignal)
+	if err != nil {
+		return nil, err
 	}
 
 	execCmd := &executor.ExecCommand{
-		Cmd:  args[0],
-		Args: args[1:],
-		User: task.User,
+		Cmd:        args[0],
+		Args:       args[1:],
+		User:       task.User,
+		TaskDir:    ctx.TaskDir.Dir,
+		Env:        ctx.TaskEnv.List(),
+		StdoutPath: ctx.StdoutFifo,
+		StderrPath: ctx.StderrFifo,
 	}
-	ps, err := exec.LaunchCmd(execCmd)
+	ps, err := exec.Launch(execCmd)
 	if err != nil {
 		pluginClient.Kill()
 		return nil, err
@@ -348,6 +348,7 @@ func (d *QemuDriver) Start(ctx *ExecContext, task *structs.Task) (*StartResponse
 		pluginClient:   pluginClient,
 		executor:       exec,
 		userPid:        ps.Pid,
+		shutdownSignal: task.KillSignal,
 		killTimeout:    GetKillTimeout(task.KillTimeout, maxKill),
 		maxKillTimeout: maxKill,
 		monitorPath:    monitorPath,
@@ -372,6 +373,7 @@ type qemuId struct {
 	MaxKillTimeout time.Duration
 	UserPid        int
 	PluginConfig   *PluginReattachConfig
+	ShutdownSignal string
 }
 
 func (d *QemuDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, error) {
@@ -403,6 +405,7 @@ func (d *QemuDriver) Open(ctx *ExecContext, handleID string) (DriverHandle, erro
 		logger:         d.logger,
 		killTimeout:    id.KillTimeout,
 		maxKillTimeout: id.MaxKillTimeout,
+		shutdownSignal: id.ShutdownSignal,
 		version:        id.Version,
 		doneCh:         make(chan struct{}),
 		waitCh:         make(chan *dstructs.WaitResult, 1),
@@ -420,6 +423,7 @@ func (h *qemuHandle) ID() string {
 		MaxKillTimeout: h.maxKillTimeout,
 		PluginConfig:   NewPluginReattachConfig(h.pluginClient.ReattachConfig()),
 		UserPid:        h.userPid,
+		ShutdownSignal: h.shutdownSignal,
 	}
 
 	data, err := json.Marshal(id)
@@ -436,7 +440,6 @@ func (h *qemuHandle) WaitCh() chan *dstructs.WaitResult {
 func (h *qemuHandle) Update(task *structs.Task) error {
 	// Store the updated kill timeout.
 	h.killTimeout = GetKillTimeout(task.KillTimeout, h.maxKillTimeout)
-	h.executor.UpdateTask(task)
 
 	// Update is not possible
 	return nil
@@ -448,6 +451,10 @@ func (h *qemuHandle) Exec(ctx context.Context, cmd string, args []string) ([]byt
 
 func (h *qemuHandle) Signal(s os.Signal) error {
 	return fmt.Errorf("Qemu driver can't send signals")
+}
+
+func (d *qemuHandle) Network() *cstructs.DriverNetwork {
+	return nil
 }
 
 func (h *qemuHandle) Kill() error {
@@ -464,7 +471,8 @@ func (h *qemuHandle) Kill() error {
 	// If Nomad did not send a graceful shutdown signal, issue an interrupt to
 	// the qemu process as a last resort
 	if gracefulShutdownSent == false {
-		if err := h.executor.ShutDown(); err != nil {
+		h.logger.Printf("[DEBUG] driver.qemu: graceful shutdown is not enabled, sending an interrupt signal to pid: %d", h.userPid)
+		if err := h.executor.Signal(os.Interrupt); err != nil {
 			if h.pluginClient.Exited() {
 				return nil
 			}
@@ -484,8 +492,8 @@ func (h *qemuHandle) Kill() error {
 		if h.pluginClient.Exited() {
 			return nil
 		}
-		if err := h.executor.Exit(); err != nil {
-			return fmt.Errorf("executor Exit failed: %v", err)
+		if err := h.executor.Shutdown(h.shutdownSignal, h.killTimeout); err != nil {
+			return fmt.Errorf("executor Destroy failed: %v", err)
 		}
 		return nil
 	}
@@ -504,8 +512,8 @@ func (h *qemuHandle) run() {
 	}
 	close(h.doneCh)
 
-	// Exit the executor
-	h.executor.Exit()
+	// Destroy the executor
+	h.executor.Shutdown(h.shutdownSignal, 0)
 	h.pluginClient.Kill()
 
 	// Send the results

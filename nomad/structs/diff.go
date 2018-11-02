@@ -105,6 +105,17 @@ func (j *Job) Diff(other *Job, contextual bool) (*JobDiff, error) {
 		diff.Objects = append(diff.Objects, conDiff...)
 	}
 
+	// Affinities diff
+	affinitiesDiff := primitiveObjectSetDiff(
+		interfaceSlice(j.Affinities),
+		interfaceSlice(other.Affinities),
+		[]string{"str"},
+		"Affinity",
+		contextual)
+	if affinitiesDiff != nil {
+		diff.Objects = append(diff.Objects, affinitiesDiff...)
+	}
+
 	// Task groups diff
 	tgs, err := taskGroupDiffs(j.TaskGroups, other.TaskGroups, contextual)
 	if err != nil {
@@ -228,10 +239,27 @@ func (tg *TaskGroup) Diff(other *TaskGroup, contextual bool) (*TaskGroupDiff, er
 		diff.Objects = append(diff.Objects, conDiff...)
 	}
 
+	// Affinities diff
+	affinitiesDiff := primitiveObjectSetDiff(
+		interfaceSlice(tg.Affinities),
+		interfaceSlice(other.Affinities),
+		[]string{"str"},
+		"Affinity",
+		contextual)
+	if affinitiesDiff != nil {
+		diff.Objects = append(diff.Objects, affinitiesDiff...)
+	}
+
 	// Restart policy diff
 	rDiff := primitiveObjectDiff(tg.RestartPolicy, other.RestartPolicy, nil, "RestartPolicy", contextual)
 	if rDiff != nil {
 		diff.Objects = append(diff.Objects, rDiff)
+	}
+
+	// Reschedule policy diff
+	reschedDiff := primitiveObjectDiff(tg.ReschedulePolicy, other.ReschedulePolicy, nil, "ReschedulePolicy", contextual)
+	if reschedDiff != nil {
+		diff.Objects = append(diff.Objects, reschedDiff)
 	}
 
 	// EphemeralDisk diff
@@ -381,6 +409,17 @@ func (t *Task) Diff(other *Task, contextual bool) (*TaskDiff, error) {
 		diff.Objects = append(diff.Objects, conDiff...)
 	}
 
+	// Affinities diff
+	affinitiesDiff := primitiveObjectSetDiff(
+		interfaceSlice(t.Affinities),
+		interfaceSlice(other.Affinities),
+		[]string{"str"},
+		"Affinity",
+		contextual)
+	if affinitiesDiff != nil {
+		diff.Objects = append(diff.Objects, affinitiesDiff...)
+	}
+
 	// Config diff
 	if cDiff := configDiff(t.Config, other.Config, contextual); cDiff != nil {
 		diff.Objects = append(diff.Objects, cDiff)
@@ -526,6 +565,15 @@ func serviceDiff(old, new *Service, contextual bool) *ObjectDiff {
 
 	// Diff the primitive fields.
 	diff.Fields = fieldDiffs(oldPrimitiveFlat, newPrimitiveFlat, contextual)
+
+	if setDiff := stringSetDiff(old.CanaryTags, new.CanaryTags, "CanaryTags", contextual); setDiff != nil {
+		diff.Objects = append(diff.Objects, setDiff)
+	}
+
+	// Tag diffs
+	if setDiff := stringSetDiff(old.Tags, new.Tags, "Tags", contextual); setDiff != nil {
+		diff.Objects = append(diff.Objects, setDiff)
+	}
 
 	// Checks diffs
 	if cDiffs := serviceCheckDiffs(old.Checks, new.Checks, contextual); cDiffs != nil {
@@ -792,6 +840,11 @@ func (r *Resources) Diff(other *Resources, contextual bool) *ObjectDiff {
 		diff.Objects = append(diff.Objects, nDiffs...)
 	}
 
+	// Requested Devices diff
+	if nDiffs := requestedDevicesDiffs(r.Devices, other.Devices, contextual); nDiffs != nil {
+		diff.Objects = append(diff.Objects, nDiffs...)
+	}
+
 	return diff
 }
 
@@ -917,6 +970,67 @@ func portDiffs(old, new []Port, dynamic bool, contextual bool) []*ObjectDiff {
 		if _, ok := oldPorts[label]; !ok {
 			diff := primitiveObjectDiff(nil, newPort, filter, name, contextual)
 			if diff != nil {
+				diffs = append(diffs, diff)
+			}
+		}
+	}
+
+	sort.Sort(ObjectDiffs(diffs))
+	return diffs
+
+}
+
+// Diff returns a diff of two requested devices. If contextual diff is enabled,
+// non-changed fields will still be returned.
+func (r *RequestedDevice) Diff(other *RequestedDevice, contextual bool) *ObjectDiff {
+	diff := &ObjectDiff{Type: DiffTypeNone, Name: "Device"}
+	var oldPrimitiveFlat, newPrimitiveFlat map[string]string
+
+	if reflect.DeepEqual(r, other) {
+		return nil
+	} else if r == nil {
+		diff.Type = DiffTypeAdded
+		newPrimitiveFlat = flatmap.Flatten(other, nil, true)
+	} else if other == nil {
+		diff.Type = DiffTypeDeleted
+		oldPrimitiveFlat = flatmap.Flatten(r, nil, true)
+	} else {
+		diff.Type = DiffTypeEdited
+		oldPrimitiveFlat = flatmap.Flatten(r, nil, true)
+		newPrimitiveFlat = flatmap.Flatten(other, nil, true)
+	}
+
+	// Diff the primitive fields.
+	diff.Fields = fieldDiffs(oldPrimitiveFlat, newPrimitiveFlat, contextual)
+
+	return diff
+}
+
+// requestedDevicesDiffs diffs a set of RequestedDevices. If contextual diff is enabled,
+// non-changed fields will still be returned.
+func requestedDevicesDiffs(old, new []*RequestedDevice, contextual bool) []*ObjectDiff {
+	makeSet := func(devices []*RequestedDevice) map[string]*RequestedDevice {
+		deviceMap := make(map[string]*RequestedDevice, len(devices))
+		for _, d := range devices {
+			deviceMap[d.Name] = d
+		}
+
+		return deviceMap
+	}
+
+	oldSet := makeSet(old)
+	newSet := makeSet(new)
+
+	var diffs []*ObjectDiff
+	for k, oldV := range oldSet {
+		newV := newSet[k]
+		if diff := oldV.Diff(newV, contextual); diff != nil {
+			diffs = append(diffs, diff)
+		}
+	}
+	for k, newV := range newSet {
+		if oldV, ok := oldSet[k]; !ok {
+			if diff := oldV.Diff(newV, contextual); diff != nil {
 				diffs = append(diffs, diff)
 			}
 		}
@@ -1211,7 +1325,7 @@ func primitiveObjectDiff(old, new interface{}, filter []string, name string, con
 // primitiveObjectSetDiff does a set difference of the old and new sets. The
 // filter parameter can be used to filter a set of primitive fields in the
 // passed structs. The name corresponds to the name of the passed objects. If
-// contextual diff is enabled, objects' primtive fields will be returned even if
+// contextual diff is enabled, objects' primitive fields will be returned even if
 // no diff exists.
 func primitiveObjectSetDiff(old, new []interface{}, filter []string, name string, contextual bool) []*ObjectDiff {
 	makeSet := func(objects []interface{}) map[string]interface{} {

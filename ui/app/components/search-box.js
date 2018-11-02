@@ -1,16 +1,19 @@
-import Ember from 'ember';
-
-const { Component, computed, run } = Ember;
+import { reads } from '@ember/object/computed';
+import Component from '@ember/component';
+import { run } from '@ember/runloop';
 
 export default Component.extend({
   // Passed to the component (mutable)
   searchTerm: null,
 
   // Used as a debounce buffer
-  _searchTerm: computed.reads('searchTerm'),
+  _searchTerm: reads('searchTerm'),
 
   // Used to throttle sets to searchTerm
   debounce: 150,
+
+  // A hook that's called when the search value changes
+  onChange() {},
 
   classNames: ['search-box', 'field', 'has-addons'],
 
@@ -23,5 +26,7 @@ export default Component.extend({
 });
 
 function updateSearch() {
-  this.set('searchTerm', this.get('_searchTerm'));
+  const newTerm = this.get('_searchTerm');
+  this.onChange(newTerm);
+  this.set('searchTerm', newTerm);
 }

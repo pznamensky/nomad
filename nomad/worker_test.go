@@ -1,14 +1,15 @@
 package nomad
 
 import (
-	"log"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	log "github.com/hashicorp/go-hclog"
 	memdb "github.com/hashicorp/go-memdb"
+
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -35,7 +36,7 @@ func (n *NoopScheduler) Process(eval *structs.Evaluation) error {
 }
 
 func init() {
-	scheduler.BuiltinSchedulers["noop"] = func(logger *log.Logger, s scheduler.State, p scheduler.Planner) scheduler.Scheduler {
+	scheduler.BuiltinSchedulers["noop"] = func(logger log.Logger, s scheduler.State, p scheduler.Planner) scheduler.Scheduler {
 		n := &NoopScheduler{
 			state:   s,
 			planner: p,
@@ -46,7 +47,7 @@ func init() {
 
 func TestWorker_dequeueEvaluation(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -82,7 +83,7 @@ func TestWorker_dequeueEvaluation(t *testing.T) {
 // evals for the same job.
 func TestWorker_dequeueEvaluation_SerialJobs(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -150,7 +151,7 @@ func TestWorker_dequeueEvaluation_SerialJobs(t *testing.T) {
 
 func TestWorker_dequeueEvaluation_paused(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -197,7 +198,7 @@ func TestWorker_dequeueEvaluation_paused(t *testing.T) {
 
 func TestWorker_dequeueEvaluation_shutdown(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -226,7 +227,7 @@ func TestWorker_dequeueEvaluation_shutdown(t *testing.T) {
 
 func TestWorker_sendAck(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -273,7 +274,7 @@ func TestWorker_sendAck(t *testing.T) {
 
 func TestWorker_waitForIndex(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -308,7 +309,7 @@ func TestWorker_waitForIndex(t *testing.T) {
 
 func TestWorker_invokeScheduler(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -326,7 +327,7 @@ func TestWorker_invokeScheduler(t *testing.T) {
 
 func TestWorker_SubmitPlan(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -341,6 +342,7 @@ func TestWorker_SubmitPlan(t *testing.T) {
 	eval1 := mock.Eval()
 	eval1.JobID = job.ID
 	s1.fsm.State().UpsertJob(1000, job)
+	s1.fsm.State().UpsertEvals(1000, []*structs.Evaluation{eval1})
 
 	// Create the register request
 	s1.evalBroker.Enqueue(eval1)
@@ -390,7 +392,7 @@ func TestWorker_SubmitPlan(t *testing.T) {
 
 func TestWorker_SubmitPlan_MissingNodeRefresh(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -460,7 +462,7 @@ func TestWorker_SubmitPlan_MissingNodeRefresh(t *testing.T) {
 
 func TestWorker_UpdateEval(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -507,7 +509,7 @@ func TestWorker_UpdateEval(t *testing.T) {
 
 func TestWorker_CreateEval(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})
@@ -555,7 +557,7 @@ func TestWorker_CreateEval(t *testing.T) {
 
 func TestWorker_ReblockEval(t *testing.T) {
 	t.Parallel()
-	s1 := testServer(t, func(c *Config) {
+	s1 := TestServer(t, func(c *Config) {
 		c.NumSchedulers = 0
 		c.EnabledSchedulers = []string{structs.JobTypeService}
 	})

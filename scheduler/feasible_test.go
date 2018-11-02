@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/nomad/helper/uuid"
 	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
+	psstructs "github.com/hashicorp/nomad/plugins/shared/structs"
+	"github.com/stretchr/testify/require"
 )
 
 func TestStaticIterator_Reset(t *testing.T) {
@@ -122,6 +125,69 @@ func TestDriverChecker(t *testing.T) {
 		if act := checker.Feasible(c.Node); act != c.Result {
 			t.Fatalf("case(%d) failed: got %v; want %v", i, act, c.Result)
 		}
+	}
+}
+
+func Test_HealthChecks(t *testing.T) {
+	require := require.New(t)
+	_, ctx := testContext(t)
+
+	nodes := []*structs.Node{
+		mock.Node(),
+		mock.Node(),
+		mock.Node(),
+	}
+	for _, e := range nodes {
+		e.Drivers = make(map[string]*structs.DriverInfo)
+	}
+	nodes[0].Attributes["driver.foo"] = "1"
+	nodes[0].Drivers["foo"] = &structs.DriverInfo{
+		Detected:          true,
+		Healthy:           true,
+		HealthDescription: "running",
+		UpdateTime:        time.Now(),
+	}
+	nodes[1].Attributes["driver.bar"] = "1"
+	nodes[1].Drivers["bar"] = &structs.DriverInfo{
+		Detected:          true,
+		Healthy:           false,
+		HealthDescription: "not running",
+		UpdateTime:        time.Now(),
+	}
+	nodes[2].Attributes["driver.baz"] = "0"
+	nodes[2].Drivers["baz"] = &structs.DriverInfo{
+		Detected:          false,
+		Healthy:           false,
+		HealthDescription: "not running",
+		UpdateTime:        time.Now(),
+	}
+
+	testDrivers := []string{"foo", "bar", "baz"}
+	cases := []struct {
+		Node   *structs.Node
+		Result bool
+	}{
+		{
+			Node:   nodes[0],
+			Result: true,
+		},
+		{
+			Node:   nodes[1],
+			Result: false,
+		},
+		{
+			Node:   nodes[2],
+			Result: false,
+		},
+	}
+
+	for i, c := range cases {
+		drivers := map[string]struct{}{
+			testDrivers[i]: {},
+		}
+		checker := NewDriverChecker(ctx, drivers)
+		act := checker.Feasible(c.Node)
+		require.Equal(act, c.Result)
 	}
 }
 
@@ -244,7 +310,7 @@ func TestResolveConstraintTarget(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		res, ok := resolveConstraintTarget(tc.target, tc.node)
+		res, ok := resolveTarget(tc.target, tc.node)
 		if ok != tc.result {
 			t.Fatalf("TC: %#v, Result: %v %v", tc, res, ok)
 		}
@@ -395,7 +461,7 @@ func TestCheckVersionConstraint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		_, ctx := testContext(t)
-		if res := checkVersionConstraint(ctx, tc.lVal, tc.rVal); res != tc.result {
+		if res := checkVersionMatch(ctx, tc.lVal, tc.rVal); res != tc.result {
 			t.Fatalf("TC: %#v, Result: %v", tc, res)
 		}
 	}
@@ -430,7 +496,7 @@ func TestCheckRegexpConstraint(t *testing.T) {
 	}
 	for _, tc := range cases {
 		_, ctx := testContext(t)
-		if res := checkRegexpConstraint(ctx, tc.lVal, tc.rVal); res != tc.result {
+		if res := checkRegexpMatch(ctx, tc.lVal, tc.rVal); res != tc.result {
 			t.Fatalf("TC: %#v, Result: %v", tc, res)
 		}
 	}
@@ -1415,7 +1481,7 @@ type mockFeasibilityChecker struct {
 	i       int
 }
 
-func newMockFeasiblityChecker(values ...bool) *mockFeasibilityChecker {
+func newMockFeasibilityChecker(values ...bool) *mockFeasibilityChecker {
 	return &mockFeasibilityChecker{retVals: values}
 }
 
@@ -1437,7 +1503,7 @@ func TestFeasibilityWrapper_JobIneligible(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{mock.Node()}
 	static := NewStaticIterator(ctx, nodes)
-	mocked := newMockFeasiblityChecker(false)
+	mocked := newMockFeasibilityChecker(false)
 	wrapper := NewFeasibilityWrapper(ctx, static, []FeasibilityChecker{mocked}, nil)
 
 	// Set the job to ineligible
@@ -1455,7 +1521,7 @@ func TestFeasibilityWrapper_JobEscapes(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{mock.Node()}
 	static := NewStaticIterator(ctx, nodes)
-	mocked := newMockFeasiblityChecker(false)
+	mocked := newMockFeasibilityChecker(false)
 	wrapper := NewFeasibilityWrapper(ctx, static, []FeasibilityChecker{mocked}, nil)
 
 	// Set the job to escaped
@@ -1480,8 +1546,8 @@ func TestFeasibilityWrapper_JobAndTg_Eligible(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{mock.Node()}
 	static := NewStaticIterator(ctx, nodes)
-	jobMock := newMockFeasiblityChecker(true)
-	tgMock := newMockFeasiblityChecker(false)
+	jobMock := newMockFeasibilityChecker(true)
+	tgMock := newMockFeasibilityChecker(false)
 	wrapper := NewFeasibilityWrapper(ctx, static, []FeasibilityChecker{jobMock}, []FeasibilityChecker{tgMock})
 
 	// Set the job to escaped
@@ -1502,8 +1568,8 @@ func TestFeasibilityWrapper_JobEligible_TgIneligible(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{mock.Node()}
 	static := NewStaticIterator(ctx, nodes)
-	jobMock := newMockFeasiblityChecker(true)
-	tgMock := newMockFeasiblityChecker(false)
+	jobMock := newMockFeasibilityChecker(true)
+	tgMock := newMockFeasibilityChecker(false)
 	wrapper := NewFeasibilityWrapper(ctx, static, []FeasibilityChecker{jobMock}, []FeasibilityChecker{tgMock})
 
 	// Set the job to escaped
@@ -1524,8 +1590,8 @@ func TestFeasibilityWrapper_JobEligible_TgEscaped(t *testing.T) {
 	_, ctx := testContext(t)
 	nodes := []*structs.Node{mock.Node()}
 	static := NewStaticIterator(ctx, nodes)
-	jobMock := newMockFeasiblityChecker(true)
-	tgMock := newMockFeasiblityChecker(true)
+	jobMock := newMockFeasibilityChecker(true)
+	tgMock := newMockFeasibilityChecker(true)
 	wrapper := NewFeasibilityWrapper(ctx, static, []FeasibilityChecker{jobMock}, []FeasibilityChecker{tgMock})
 
 	// Set the job to escaped
@@ -1544,5 +1610,468 @@ func TestFeasibilityWrapper_JobEligible_TgEscaped(t *testing.T) {
 
 	if e, ok := ctx.Eligibility().taskGroups["foo"][cc]; !ok || e != EvalComputedClassEscaped {
 		t.Fatalf("bad: %v %v", e, ok)
+	}
+}
+
+func TestSetContainsAny(t *testing.T) {
+	require.True(t, checkSetContainsAny("a", "a"))
+	require.True(t, checkSetContainsAny("a,b", "a"))
+	require.True(t, checkSetContainsAny("  a,b  ", "a "))
+	require.True(t, checkSetContainsAny("a", "a"))
+	require.False(t, checkSetContainsAny("b", "a"))
+}
+
+func TestDeviceChecker(t *testing.T) {
+	getTg := func(devices ...*structs.RequestedDevice) *structs.TaskGroup {
+		return &structs.TaskGroup{
+			Name: "example",
+			Tasks: []*structs.Task{
+				{
+					Resources: &structs.Resources{
+						Devices: devices,
+					},
+				},
+			},
+		}
+	}
+
+	// Just type
+	gpuTypeReq := &structs.RequestedDevice{
+		Name:  "gpu",
+		Count: 1,
+	}
+	fpgaTypeReq := &structs.RequestedDevice{
+		Name:  "fpga",
+		Count: 1,
+	}
+
+	// vendor/type
+	gpuVendorTypeReq := &structs.RequestedDevice{
+		Name:  "nvidia/gpu",
+		Count: 1,
+	}
+	fpgaVendorTypeReq := &structs.RequestedDevice{
+		Name:  "nvidia/fpga",
+		Count: 1,
+	}
+
+	// vendor/type/model
+	gpuFullReq := &structs.RequestedDevice{
+		Name:  "nvidia/gpu/1080ti",
+		Count: 1,
+	}
+	fpgaFullReq := &structs.RequestedDevice{
+		Name:  "nvidia/fpga/F100",
+		Count: 1,
+	}
+
+	// Just type but high count
+	gpuTypeHighCountReq := &structs.RequestedDevice{
+		Name:  "gpu",
+		Count: 3,
+	}
+
+	getNode := func(devices ...*structs.NodeDeviceResource) *structs.Node {
+		n := mock.Node()
+		n.NodeResources.Devices = devices
+		return n
+	}
+
+	nvidia := &structs.NodeDeviceResource{
+		Vendor: "nvidia",
+		Type:   "gpu",
+		Name:   "1080ti",
+		Attributes: map[string]*psstructs.Attribute{
+			"memory":        psstructs.NewIntAttribute(4, psstructs.UnitGiB),
+			"pci_bandwidth": psstructs.NewIntAttribute(995, psstructs.UnitMiBPerS),
+			"cores_clock":   psstructs.NewIntAttribute(800, psstructs.UnitMHz),
+		},
+		Instances: []*structs.NodeDevice{
+			{
+				ID:      uuid.Generate(),
+				Healthy: true,
+			},
+			{
+				ID:      uuid.Generate(),
+				Healthy: true,
+			},
+		},
+	}
+
+	nvidiaUnhealthy := &structs.NodeDeviceResource{
+		Vendor: "nvidia",
+		Type:   "gpu",
+		Name:   "1080ti",
+		Instances: []*structs.NodeDevice{
+			{
+				ID:      uuid.Generate(),
+				Healthy: false,
+			},
+			{
+				ID:      uuid.Generate(),
+				Healthy: false,
+			},
+		},
+	}
+
+	intel := &structs.NodeDeviceResource{
+		Vendor: "intel",
+		Type:   "gpu",
+		Name:   "GT640",
+		Instances: []*structs.NodeDevice{
+			{
+				ID:      uuid.Generate(),
+				Healthy: true,
+			},
+			{
+				ID:      uuid.Generate(),
+				Healthy: false,
+			},
+		},
+	}
+
+	cases := []struct {
+		Name             string
+		Result           bool
+		NodeDevices      []*structs.NodeDeviceResource
+		RequestedDevices []*structs.RequestedDevice
+	}{
+		{
+			Name:             "no devices on node",
+			Result:           false,
+			NodeDevices:      nil,
+			RequestedDevices: []*structs.RequestedDevice{gpuTypeReq},
+		},
+		{
+			Name:             "no requested devices on empty node",
+			Result:           true,
+			NodeDevices:      nil,
+			RequestedDevices: nil,
+		},
+		{
+			Name:             "gpu devices by type",
+			Result:           true,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{gpuTypeReq},
+		},
+		{
+			Name:             "wrong devices by type",
+			Result:           false,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{fpgaTypeReq},
+		},
+		{
+			Name:             "devices by type unhealthy node",
+			Result:           false,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidiaUnhealthy},
+			RequestedDevices: []*structs.RequestedDevice{gpuTypeReq},
+		},
+		{
+			Name:             "gpu devices by vendor/type",
+			Result:           true,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{gpuVendorTypeReq},
+		},
+		{
+			Name:             "wrong devices by vendor/type",
+			Result:           false,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{fpgaVendorTypeReq},
+		},
+		{
+			Name:             "gpu devices by vendor/type/model",
+			Result:           true,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{gpuFullReq},
+		},
+		{
+			Name:             "wrong devices by vendor/type/model",
+			Result:           false,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{fpgaFullReq},
+		},
+		{
+			Name:             "too many requested",
+			Result:           false,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{gpuTypeHighCountReq},
+		},
+		{
+			Name:             "request split over groups",
+			Result:           true,
+			NodeDevices:      []*structs.NodeDeviceResource{nvidia, intel},
+			RequestedDevices: []*structs.RequestedDevice{gpuTypeHighCountReq},
+		},
+		{
+			Name:        "meets constraints requirement",
+			Result:      true,
+			NodeDevices: []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{
+				{
+					Name:  "nvidia/gpu",
+					Count: 1,
+					Constraints: []*structs.Constraint{
+						{
+							Operand: "=",
+							LTarget: "${driver.model}",
+							RTarget: "1080ti",
+						},
+						{
+							Operand: ">",
+							LTarget: "${driver.attr.memory}",
+							RTarget: "1320.5 MB",
+						},
+						{
+							Operand: "<=",
+							LTarget: "${driver.attr.pci_bandwidth}",
+							RTarget: ".98   GiB/s",
+						},
+						{
+							Operand: "=",
+							LTarget: "${driver.attr.cores_clock}",
+							RTarget: "800MHz",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:        "meets constraints requirement multiple count",
+			Result:      true,
+			NodeDevices: []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{
+				{
+					Name:  "nvidia/gpu",
+					Count: 2,
+					Constraints: []*structs.Constraint{
+						{
+							Operand: "=",
+							LTarget: "${driver.model}",
+							RTarget: "1080ti",
+						},
+						{
+							Operand: ">",
+							LTarget: "${driver.attr.memory}",
+							RTarget: "1320.5 MB",
+						},
+						{
+							Operand: "<=",
+							LTarget: "${driver.attr.pci_bandwidth}",
+							RTarget: ".98   GiB/s",
+						},
+						{
+							Operand: "=",
+							LTarget: "${driver.attr.cores_clock}",
+							RTarget: "800MHz",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:        "meets constraints requirement over count",
+			Result:      false,
+			NodeDevices: []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{
+				{
+					Name:  "nvidia/gpu",
+					Count: 5,
+					Constraints: []*structs.Constraint{
+						{
+							Operand: "=",
+							LTarget: "${driver.model}",
+							RTarget: "1080ti",
+						},
+						{
+							Operand: ">",
+							LTarget: "${driver.attr.memory}",
+							RTarget: "1320.5 MB",
+						},
+						{
+							Operand: "<=",
+							LTarget: "${driver.attr.pci_bandwidth}",
+							RTarget: ".98   GiB/s",
+						},
+						{
+							Operand: "=",
+							LTarget: "${driver.attr.cores_clock}",
+							RTarget: "800MHz",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:        "does not meet first constraint",
+			Result:      false,
+			NodeDevices: []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{
+				{
+					Name:  "nvidia/gpu",
+					Count: 1,
+					Constraints: []*structs.Constraint{
+						{
+							Operand: "=",
+							LTarget: "${driver.model}",
+							RTarget: "2080ti",
+						},
+						{
+							Operand: ">",
+							LTarget: "${driver.attr.memory}",
+							RTarget: "1320.5 MB",
+						},
+						{
+							Operand: "<=",
+							LTarget: "${driver.attr.pci_bandwidth}",
+							RTarget: ".98   GiB/s",
+						},
+						{
+							Operand: "=",
+							LTarget: "${driver.attr.cores_clock}",
+							RTarget: "800MHz",
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:        "does not meet second constraint",
+			Result:      false,
+			NodeDevices: []*structs.NodeDeviceResource{nvidia},
+			RequestedDevices: []*structs.RequestedDevice{
+				{
+					Name:  "nvidia/gpu",
+					Count: 1,
+					Constraints: []*structs.Constraint{
+						{
+							Operand: "=",
+							LTarget: "${driver.model}",
+							RTarget: "1080ti",
+						},
+						{
+							Operand: "<",
+							LTarget: "${driver.attr.memory}",
+							RTarget: "1320.5 MB",
+						},
+						{
+							Operand: "<=",
+							LTarget: "${driver.attr.pci_bandwidth}",
+							RTarget: ".98   GiB/s",
+						},
+						{
+							Operand: "=",
+							LTarget: "${driver.attr.cores_clock}",
+							RTarget: "800MHz",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			_, ctx := testContext(t)
+			checker := NewDeviceChecker(ctx)
+			checker.SetTaskGroup(getTg(c.RequestedDevices...))
+			if act := checker.Feasible(getNode(c.NodeDevices...)); act != c.Result {
+				t.Fatalf("got %v; want %v", act, c.Result)
+			}
+		})
+	}
+}
+
+func TestCheckAttributeConstraint(t *testing.T) {
+	type tcase struct {
+		op         string
+		lVal, rVal *psstructs.Attribute
+		result     bool
+	}
+	cases := []tcase{
+		{
+			op:     "=",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("foo"),
+			result: true,
+		},
+		{
+			op:     "is",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("foo"),
+			result: true,
+		},
+		{
+			op:     "==",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("foo"),
+			result: true,
+		},
+		{
+			op:     "!=",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("foo"),
+			result: false,
+		},
+		{
+			op:     "!=",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("bar"),
+			result: true,
+		},
+		{
+			op:     "not",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("bar"),
+			result: true,
+		},
+		{
+			op:     structs.ConstraintVersion,
+			lVal:   psstructs.NewStringAttribute("1.2.3"),
+			rVal:   psstructs.NewStringAttribute("~> 1.0"),
+			result: true,
+		},
+		{
+			op:     structs.ConstraintRegex,
+			lVal:   psstructs.NewStringAttribute("foobarbaz"),
+			rVal:   psstructs.NewStringAttribute("[\\w]+"),
+			result: true,
+		},
+		{
+			op:     "<",
+			lVal:   psstructs.NewStringAttribute("foo"),
+			rVal:   psstructs.NewStringAttribute("bar"),
+			result: false,
+		},
+		{
+			op:     structs.ConstraintSetContains,
+			lVal:   psstructs.NewStringAttribute("foo,bar,baz"),
+			rVal:   psstructs.NewStringAttribute("foo,  bar  "),
+			result: true,
+		},
+		{
+			op:     structs.ConstraintSetContainsAll,
+			lVal:   psstructs.NewStringAttribute("foo,bar,baz"),
+			rVal:   psstructs.NewStringAttribute("foo,  bar  "),
+			result: true,
+		},
+		{
+			op:     structs.ConstraintSetContains,
+			lVal:   psstructs.NewStringAttribute("foo,bar,baz"),
+			rVal:   psstructs.NewStringAttribute("foo,bam"),
+			result: false,
+		},
+		{
+			op:     structs.ConstraintSetContainsAny,
+			lVal:   psstructs.NewStringAttribute("foo,bar,baz"),
+			rVal:   psstructs.NewStringAttribute("foo,bam"),
+			result: true,
+		},
+	}
+
+	for _, tc := range cases {
+		_, ctx := testContext(t)
+		if res := checkAttributeConstraint(ctx, tc.op, tc.lVal, tc.rVal); res != tc.result {
+			t.Fatalf("TC: %#v, Result: %v", tc, res)
+		}
 	}
 }

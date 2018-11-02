@@ -2,7 +2,8 @@ package scheduler
 
 import (
 	"fmt"
-	"log"
+
+	log "github.com/hashicorp/go-hclog"
 
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/nomad/nomad/state"
@@ -27,7 +28,7 @@ var BuiltinSchedulers = map[string]Factory{
 
 // NewScheduler is used to instantiate and return a new scheduler
 // given the scheduler name, initial state, and planner.
-func NewScheduler(name string, logger *log.Logger, state State, planner Planner) (Scheduler, error) {
+func NewScheduler(name string, logger log.Logger, state State, planner Planner) (Scheduler, error) {
 	// Lookup the factory function
 	factory, ok := BuiltinSchedulers[name]
 	if !ok {
@@ -40,7 +41,7 @@ func NewScheduler(name string, logger *log.Logger, state State, planner Planner)
 }
 
 // Factory is used to instantiate a new Scheduler
-type Factory func(*log.Logger, State, Planner) Scheduler
+type Factory func(log.Logger, State, Planner) Scheduler
 
 // Scheduler is the top level instance for a scheduler. A scheduler is
 // meant to only encapsulate business logic, pushing the various plumbing
@@ -48,7 +49,7 @@ type Factory func(*log.Logger, State, Planner) Scheduler
 // a time. The evaluation may result in task allocations which are computed
 // optimistically, as there are many concurrent evaluations being processed.
 // The task allocations are submitted as a plan, and the current leader will
-// coordinate the commmits to prevent oversubscription or improper allocations
+// coordinate the commits to prevent oversubscription or improper allocations
 // based on stale state.
 type Scheduler interface {
 	// Process is used to handle a new evaluation. The scheduler is free to

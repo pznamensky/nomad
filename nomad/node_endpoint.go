@@ -2,15 +2,15 @@ package nomad
 
 import (
 	"context"
-	"crypto/subtle"
-	"encoding/base64"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/crypto/blake2b"
 	"golang.org/x/sync/errgroup"
+
+	log "github.com/hashicorp/go-hclog"
+	vapi "github.com/hashicorp/vault/api"
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-memdb"
@@ -20,7 +20,6 @@ import (
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/raft"
-	vapi "github.com/hashicorp/vault/api"
 )
 
 const (
@@ -30,18 +29,42 @@ const (
 	// maxParallelRequestsPerDerive  is the maximum number of parallel Vault
 	// create token requests that may be outstanding per derive request
 	maxParallelRequestsPerDerive = 16
+
+	// NodeDrainEvents are the various drain messages
+	NodeDrainEventDrainSet      = "Node drain strategy set"
+	NodeDrainEventDrainDisabled = "Node drain disabled"
+	NodeDrainEventDrainUpdated  = "Node drain stategy updated"
+
+	// NodeEligibilityEventEligible is used when the nodes eligiblity is marked
+	// eligible
+	NodeEligibilityEventEligible = "Node marked as eligible for scheduling"
+
+	// NodeEligibilityEventIneligible is used when the nodes eligiblity is marked
+	// ineligible
+	NodeEligibilityEventIneligible = "Node marked as ineligible for scheduling"
+
+	// NodeHeartbeatEventReregistered is the message used when the node becomes
+	// reregistered by the heartbeat.
+	NodeHeartbeatEventReregistered = "Node reregistered by heartbeat"
 )
 
 // Node endpoint is used for client interactions
 type Node struct {
-	srv *Server
+	srv    *Server
+	logger log.Logger
+
+	// ctx provides context regarding the underlying connection
+	ctx *RPCContext
 
 	// updates holds pending client status updates for allocations
 	updates []*structs.Allocation
 
+	// evals holds pending rescheduling eval updates triggered by failed allocations
+	evals []*structs.Evaluation
+
 	// updateFuture is used to wait for the pending batch update
 	// to complete. This may be nil if no batch is pending.
-	updateFuture *batchFuture
+	updateFuture *structs.BatchFuture
 
 	// updateTimer is the timer that will trigger the next batch
 	// update, and may be nil if there is no batch pending.
@@ -55,6 +78,14 @@ type Node struct {
 // Register is used to upsert a client that is available for scheduling
 func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUpdateResponse) error {
 	if done, err := n.srv.forward("Node.Register", args, args, reply); done {
+		// We have a valid node connection since there is no error from the
+		// forwarded server, so add the mapping to cache the
+		// connection and allow the server to send RPCs to the client.
+		if err == nil && n.ctx != nil && n.ctx.NodeID == "" {
+			n.ctx.NodeID = args.Node.ID
+			n.srv.addNodeConn(n.ctx)
+		}
+
 		return err
 	}
 	defer metrics.MeasureSince([]string{"nomad", "client", "register"}, time.Now())
@@ -87,6 +118,11 @@ func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUp
 		return fmt.Errorf("invalid status for node")
 	}
 
+	// Default to eligible for scheduling if unset
+	if args.Node.SchedulingEligibility == "" {
+		args.Node.SchedulingEligibility = structs.NodeSchedulingEligible
+	}
+
 	// Set the timestamp when the node is registered
 	args.Node.StatusUpdatedAt = time.Now().Unix()
 
@@ -114,10 +150,18 @@ func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUp
 		}
 	}
 
+	// We have a valid node connection, so add the mapping to cache the
+	// connection and allow the server to send RPCs to the client. We only cache
+	// the connection if it is not being forwarded from another server.
+	if n.ctx != nil && n.ctx.NodeID == "" && !args.IsForwarded() {
+		n.ctx.NodeID = args.Node.ID
+		n.srv.addNodeConn(n.ctx)
+	}
+
 	// Commit this update via Raft
 	_, index, err := n.srv.raftApply(structs.NodeRegisterRequestType, args)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: Register failed: %v", err)
+		n.logger.Error("register failed", "error", err)
 		return err
 	}
 	reply.NodeModifyIndex = index
@@ -131,7 +175,7 @@ func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUp
 	if structs.ShouldDrainNode(args.Node.Status) || transitionToReady {
 		evalIDs, evalIndex, err := n.createNodeEvals(args.Node.ID, index)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: eval creation failed: %v", err)
+			n.logger.Error("eval creation failed", "error", err)
 			return err
 		}
 		reply.EvalIDs = evalIDs
@@ -142,7 +186,7 @@ func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUp
 	if !args.Node.TerminalStatus() {
 		ttl, err := n.srv.resetHeartbeatTimer(args.Node.ID)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: heartbeat reset failed: %v", err)
+			n.logger.Error("heartbeat reset failed", "error", err)
 			return err
 		}
 		reply.HeartbeatTTL = ttl
@@ -158,7 +202,7 @@ func (n *Node) Register(args *structs.NodeRegisterRequest, reply *structs.NodeUp
 	n.srv.peerLock.RLock()
 	defer n.srv.peerLock.RUnlock()
 	if err := n.constructNodeServerInfoResponse(snap, reply); err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: failed to populate NodeUpdateResponse: %v", err)
+		n.logger.Error("failed to populate NodeUpdateResponse", "error", err)
 		return err
 	}
 
@@ -171,10 +215,10 @@ func (n *Node) constructNodeServerInfoResponse(snap *state.StateSnapshot, reply 
 
 	// Reply with config information required for future RPC requests
 	reply.Servers = make([]*structs.NodeServerInfo, 0, len(n.srv.localPeers))
-	for k, v := range n.srv.localPeers {
+	for _, v := range n.srv.localPeers {
 		reply.Servers = append(reply.Servers,
 			&structs.NodeServerInfo{
-				RPCAdvertiseAddr: string(k),
+				RPCAdvertiseAddr: v.RPCAddr.String(),
 				RPCMajorVersion:  int32(v.MajorVersion),
 				RPCMinorVersion:  int32(v.MinorVersion),
 				Datacenter:       v.Datacenter,
@@ -238,7 +282,7 @@ func (n *Node) Deregister(args *structs.NodeDeregisterRequest, reply *structs.No
 	// Commit this update via Raft
 	_, index, err := n.srv.raftApply(structs.NodeDeregisterRequestType, args)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: Deregister failed: %v", err)
+		n.logger.Error("deregister failed", "error", err)
 		return err
 	}
 
@@ -248,21 +292,21 @@ func (n *Node) Deregister(args *structs.NodeDeregisterRequest, reply *structs.No
 	// Create the evaluations for this node
 	evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, index)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: eval creation failed: %v", err)
+		n.logger.Error("eval creation failed", "error", err)
 		return err
 	}
 
 	// Determine if there are any Vault accessors on the node
 	accessors, err := snap.VaultAccessorsByNode(ws, args.NodeID)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: looking up accessors for node %q failed: %v", args.NodeID, err)
+		n.logger.Error("looking up accessors for node failed", "node_id", args.NodeID, "error", err)
 		return err
 	}
 
 	if l := len(accessors); l != 0 {
-		n.srv.logger.Printf("[DEBUG] nomad.client: revoking %d accessors on node %q due to deregister", l, args.NodeID)
+		n.logger.Debug("revoking accessors on node due to deregister", "num_accessors", l, "node_id", args.NodeID)
 		if err := n.srv.vault.RevokeTokens(context.Background(), accessors, true); err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: revoking accessors for node %q failed: %v", args.NodeID, err)
+			n.logger.Error("revoking accessors for node failed", "node_id", args.NodeID, "error", err)
 			return err
 		}
 	}
@@ -278,6 +322,14 @@ func (n *Node) Deregister(args *structs.NodeDeregisterRequest, reply *structs.No
 // UpdateStatus is used to update the status of a client node
 func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *structs.NodeUpdateResponse) error {
 	if done, err := n.srv.forward("Node.UpdateStatus", args, args, reply); done {
+		// We have a valid node connection since there is no error from the
+		// forwarded server, so add the mapping to cache the
+		// connection and allow the server to send RPCs to the client.
+		if err == nil && n.ctx != nil && n.ctx.NodeID == "" {
+			n.ctx.NodeID = args.NodeID
+			n.srv.addNodeConn(n.ctx)
+		}
+
 		return err
 	}
 	defer metrics.MeasureSince([]string{"nomad", "client", "update_status"}, time.Now())
@@ -305,6 +357,14 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 		return fmt.Errorf("node not found")
 	}
 
+	// We have a valid node connection, so add the mapping to cache the
+	// connection and allow the server to send RPCs to the client. We only cache
+	// the connection if it is not being forwarded from another server.
+	if n.ctx != nil && n.ctx.NodeID == "" && !args.IsForwarded() {
+		n.ctx.NodeID = args.NodeID
+		n.srv.addNodeConn(n.ctx)
+	}
+
 	// XXX: Could use the SecretID here but have to update the heartbeat system
 	// to track SecretIDs.
 
@@ -314,9 +374,17 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 	// Commit this update via Raft
 	var index uint64
 	if node.Status != args.Status {
+		// Attach an event if we are updating the node status to ready when it
+		// is down via a heartbeat
+		if node.Status == structs.NodeStatusDown && args.NodeEvent == nil {
+			args.NodeEvent = structs.NewNodeEvent().
+				SetSubsystem(structs.NodeEventSubsystemCluster).
+				SetMessage(NodeHeartbeatEventReregistered)
+		}
+
 		_, index, err = n.srv.raftApply(structs.NodeUpdateStatusRequestType, args)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: status update failed: %v", err)
+			n.logger.Error("status update failed", "error", err)
 			return err
 		}
 		reply.NodeModifyIndex = index
@@ -327,7 +395,7 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 	if structs.ShouldDrainNode(args.Status) || transitionToReady {
 		evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, index)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: eval creation failed: %v", err)
+			n.logger.Error("eval creation failed", "error", err)
 			return err
 		}
 		reply.EvalIDs = evalIDs
@@ -340,21 +408,21 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 		// Determine if there are any Vault accessors on the node
 		accessors, err := n.srv.State().VaultAccessorsByNode(ws, args.NodeID)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: looking up accessors for node %q failed: %v", args.NodeID, err)
+			n.logger.Error("looking up accessors for node failed", "node_id", args.NodeID, "error", err)
 			return err
 		}
 
 		if l := len(accessors); l != 0 {
-			n.srv.logger.Printf("[DEBUG] nomad.client: revoking %d accessors on node %q due to down state", l, args.NodeID)
+			n.logger.Debug("revoking accessors on node due to down state", "num_accessors", l, "node_id", args.NodeID)
 			if err := n.srv.vault.RevokeTokens(context.Background(), accessors, true); err != nil {
-				n.srv.logger.Printf("[ERR] nomad.client: revoking accessors for node %q failed: %v", args.NodeID, err)
+				n.logger.Error("revoking accessors for node failed", "node_id", args.NodeID, "error", err)
 				return err
 			}
 		}
 	default:
 		ttl, err := n.srv.resetHeartbeatTimer(args.NodeID)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: heartbeat reset failed: %v", err)
+			n.logger.Error("heartbeat reset failed", "error", err)
 			return err
 		}
 		reply.HeartbeatTTL = ttl
@@ -365,7 +433,7 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 	n.srv.peerLock.RLock()
 	defer n.srv.peerLock.RUnlock()
 	if err := n.constructNodeServerInfoResponse(snap, reply); err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: failed to populate NodeUpdateResponse: %v", err)
+		n.logger.Error("failed to populate NodeUpdateResponse", "error", err)
 		return err
 	}
 
@@ -373,7 +441,7 @@ func (n *Node) UpdateStatus(args *structs.NodeUpdateStatusRequest, reply *struct
 }
 
 // transitionedToReady is a helper that takes a nodes new and old status and
-// returns whether it has transistioned to ready.
+// returns whether it has transitioned to ready.
 func transitionedToReady(newStatus, oldStatus string) bool {
 	initToReady := oldStatus == structs.NodeStatusInit && newStatus == structs.NodeStatusReady
 	terminalToReady := oldStatus == structs.NodeStatusDown && newStatus == structs.NodeStatusReady
@@ -399,14 +467,16 @@ func (n *Node) UpdateDrain(args *structs.NodeUpdateDrainRequest,
 	if args.NodeID == "" {
 		return fmt.Errorf("missing node ID for drain update")
 	}
+	if args.NodeEvent != nil {
+		return fmt.Errorf("node event must not be set")
+	}
 
 	// Look for the node
 	snap, err := n.srv.fsm.State().Snapshot()
 	if err != nil {
 		return err
 	}
-	ws := memdb.NewWatchSet()
-	node, err := snap.NodeByID(ws, args.NodeID)
+	node, err := snap.NodeByID(nil, args.NodeID)
 	if err != nil {
 		return err
 	}
@@ -414,29 +484,145 @@ func (n *Node) UpdateDrain(args *structs.NodeUpdateDrainRequest,
 		return fmt.Errorf("node not found")
 	}
 
-	// Update the timestamp to
-	node.StatusUpdatedAt = time.Now().Unix()
+	// COMPAT: Remove in 0.9. Attempt to upgrade the request if it is of the old
+	// format.
+	if args.Drain && args.DrainStrategy == nil {
+		args.DrainStrategy = &structs.DrainStrategy{
+			DrainSpec: structs.DrainSpec{
+				Deadline: -1 * time.Second, // Force drain
+			},
+		}
+	}
+
+	// Mark the deadline time
+	if args.DrainStrategy != nil && args.DrainStrategy.Deadline.Nanoseconds() > 0 {
+		args.DrainStrategy.ForceDeadline = time.Now().Add(args.DrainStrategy.Deadline)
+	}
+
+	// Construct the node event
+	args.NodeEvent = structs.NewNodeEvent().SetSubsystem(structs.NodeEventSubsystemDrain)
+	if node.DrainStrategy == nil && args.DrainStrategy != nil {
+		args.NodeEvent.SetMessage(NodeDrainEventDrainSet)
+	} else if node.DrainStrategy != nil && args.DrainStrategy != nil {
+		args.NodeEvent.SetMessage(NodeDrainEventDrainUpdated)
+	} else if node.DrainStrategy != nil && args.DrainStrategy == nil {
+		args.NodeEvent.SetMessage(NodeDrainEventDrainDisabled)
+	} else {
+		args.NodeEvent = nil
+	}
 
 	// Commit this update via Raft
-	var index uint64
-	if node.Drain != args.Drain {
-		_, index, err = n.srv.raftApply(structs.NodeUpdateDrainRequestType, args)
-		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: drain update failed: %v", err)
-			return err
-		}
-		reply.NodeModifyIndex = index
-	}
-
-	// Always attempt to create Node evaluations because there may be a System
-	// job registered that should be evaluated.
-	evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, index)
+	_, index, err := n.srv.raftApply(structs.NodeUpdateDrainRequestType, args)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: eval creation failed: %v", err)
+		n.logger.Error("drain update failed", "error", err)
 		return err
 	}
-	reply.EvalIDs = evalIDs
-	reply.EvalCreateIndex = evalIndex
+	reply.NodeModifyIndex = index
+
+	// If the node is transitioning to be eligible, create Node evaluations
+	// because there may be a System job registered that should be evaluated.
+	if node.SchedulingEligibility == structs.NodeSchedulingIneligible && args.MarkEligible && args.DrainStrategy == nil {
+		evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, index)
+		if err != nil {
+			n.logger.Error("eval creation failed", "error", err)
+			return err
+		}
+		reply.EvalIDs = evalIDs
+		reply.EvalCreateIndex = evalIndex
+	}
+
+	// Set the reply index
+	reply.Index = index
+	return nil
+}
+
+// UpdateEligibility is used to update the scheduling eligibility of a node
+func (n *Node) UpdateEligibility(args *structs.NodeUpdateEligibilityRequest,
+	reply *structs.NodeEligibilityUpdateResponse) error {
+	if done, err := n.srv.forward("Node.UpdateEligibility", args, args, reply); done {
+		return err
+	}
+	defer metrics.MeasureSince([]string{"nomad", "client", "update_eligibility"}, time.Now())
+
+	// Check node write permissions
+	if aclObj, err := n.srv.ResolveToken(args.AuthToken); err != nil {
+		return err
+	} else if aclObj != nil && !aclObj.AllowNodeWrite() {
+		return structs.ErrPermissionDenied
+	}
+
+	// Verify the arguments
+	if args.NodeID == "" {
+		return fmt.Errorf("missing node ID for setting scheduling eligibility")
+	}
+	if args.NodeEvent != nil {
+		return fmt.Errorf("node event must not be set")
+	}
+
+	// Check that only allowed types are set
+	switch args.Eligibility {
+	case structs.NodeSchedulingEligible, structs.NodeSchedulingIneligible:
+	default:
+		return fmt.Errorf("invalid scheduling eligibility %q", args.Eligibility)
+	}
+
+	// Look for the node
+	snap, err := n.srv.fsm.State().Snapshot()
+	if err != nil {
+		return err
+	}
+	node, err := snap.NodeByID(nil, args.NodeID)
+	if err != nil {
+		return err
+	}
+	if node == nil {
+		return fmt.Errorf("node not found")
+	}
+
+	if node.DrainStrategy != nil && args.Eligibility == structs.NodeSchedulingEligible {
+		return fmt.Errorf("can not set node's scheduling eligibility to eligible while it is draining")
+	}
+
+	switch args.Eligibility {
+	case structs.NodeSchedulingEligible, structs.NodeSchedulingIneligible:
+	default:
+		return fmt.Errorf("invalid scheduling eligibility %q", args.Eligibility)
+	}
+
+	// Construct the node event
+	args.NodeEvent = structs.NewNodeEvent().SetSubsystem(structs.NodeEventSubsystemCluster)
+	if node.SchedulingEligibility == args.Eligibility {
+		return nil // Nothing to do
+	} else if args.Eligibility == structs.NodeSchedulingEligible {
+		args.NodeEvent.SetMessage(NodeEligibilityEventEligible)
+	} else {
+		args.NodeEvent.SetMessage(NodeEligibilityEventIneligible)
+	}
+
+	// Commit this update via Raft
+	outErr, index, err := n.srv.raftApply(structs.NodeUpdateEligibilityRequestType, args)
+	if err != nil {
+		n.logger.Error("eligibility update failed", "error", err)
+		return err
+	}
+	if outErr != nil {
+		if err, ok := outErr.(error); ok && err != nil {
+			n.logger.Error("eligibility update failed", "error", err)
+			return err
+		}
+	}
+
+	// If the node is transitioning to be eligible, create Node evaluations
+	// because there may be a System job registered that should be evaluated.
+	if node.SchedulingEligibility == structs.NodeSchedulingIneligible && args.Eligibility == structs.NodeSchedulingEligible {
+		evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, index)
+		if err != nil {
+			n.logger.Error("eval creation failed", "error", err)
+			return err
+		}
+		reply.EvalIDs = evalIDs
+		reply.EvalCreateIndex = evalIndex
+	}
 
 	// Set the reply index
 	reply.Index = index
@@ -479,7 +665,7 @@ func (n *Node) Evaluate(args *structs.NodeEvaluateRequest, reply *structs.NodeUp
 	// Create the evaluation
 	evalIDs, evalIndex, err := n.createNodeEvals(args.NodeID, node.ModifyIndex)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: eval creation failed: %v", err)
+		n.logger.Error("eval creation failed", "error", err)
 		return err
 	}
 	reply.EvalIDs = evalIDs
@@ -491,7 +677,7 @@ func (n *Node) Evaluate(args *structs.NodeEvaluateRequest, reply *structs.NodeUp
 	n.srv.peerLock.RLock()
 	defer n.srv.peerLock.RUnlock()
 	if err := n.constructNodeServerInfoResponse(snap, reply); err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: failed to populate NodeUpdateResponse: %v", err)
+		n.logger.Error("failed to populate NodeUpdateResponse", "error", err)
 		return err
 	}
 	return nil
@@ -658,38 +844,19 @@ func (n *Node) GetAllocs(args *structs.NodeSpecificRequest,
 	return n.srv.blockingRPC(&opts)
 }
 
-// GenerateMigrateToken will create a token for a client to access an
-// authenticated volume of another client to migrate data for sticky volumes.
-func GenerateMigrateToken(allocID, nodeSecretID string) (string, error) {
-	h, err := blake2b.New512([]byte(nodeSecretID))
-	if err != nil {
-		return "", err
-	}
-	h.Write([]byte(allocID))
-	return base64.URLEncoding.EncodeToString(h.Sum(nil)), nil
-}
-
-// CompareMigrateToken returns true if two migration tokens can be computed and
-// are equal.
-func CompareMigrateToken(allocID, nodeSecretID, otherMigrateToken string) bool {
-	h, err := blake2b.New512([]byte(nodeSecretID))
-	if err != nil {
-		return false
-	}
-	h.Write([]byte(allocID))
-
-	otherBytes, err := base64.URLEncoding.DecodeString(otherMigrateToken)
-	if err != nil {
-		return false
-	}
-	return subtle.ConstantTimeCompare(h.Sum(nil), otherBytes) == 1
-}
-
 // GetClientAllocs is used to request a lightweight list of alloc modify indexes
 // per allocation.
 func (n *Node) GetClientAllocs(args *structs.NodeSpecificRequest,
 	reply *structs.NodeClientAllocsResponse) error {
 	if done, err := n.srv.forward("Node.GetClientAllocs", args, args, reply); done {
+		// We have a valid node connection since there is no error from the
+		// forwarded server, so add the mapping to cache the
+		// connection and allow the server to send RPCs to the client.
+		if err == nil && n.ctx != nil && n.ctx.NodeID == "" {
+			n.ctx.NodeID = args.NodeID
+			n.srv.addNodeConn(n.ctx)
+		}
+
 		return err
 	}
 	defer metrics.MeasureSince([]string{"nomad", "client", "get_client_allocs"}, time.Now())
@@ -722,6 +889,14 @@ func (n *Node) GetClientAllocs(args *structs.NodeSpecificRequest,
 					return fmt.Errorf("missing node secret ID for client status update")
 				} else if args.SecretID != node.SecretID {
 					return fmt.Errorf("node secret ID does not match")
+				}
+
+				// We have a valid node connection, so add the mapping to cache the
+				// connection and allow the server to send RPCs to the client. We only cache
+				// the connection if it is not being forwarded from another server.
+				if n.ctx != nil && n.ctx.NodeID == "" && !args.IsForwarded() {
+					n.ctx.NodeID = args.NodeID
+					n.srv.addNodeConn(n.ctx)
 				}
 
 				var err error
@@ -767,7 +942,7 @@ func (n *Node) GetClientAllocs(args *structs.NodeSpecificRequest,
 								continue
 							}
 
-							token, err := GenerateMigrateToken(prevAllocation.ID, allocNode.SecretID)
+							token, err := structs.GenerateMigrateToken(prevAllocation.ID, allocNode.SecretID)
 							if err != nil {
 								return err
 							}
@@ -820,32 +995,74 @@ func (n *Node) UpdateAlloc(args *structs.AllocUpdateRequest, reply *structs.Gene
 		return fmt.Errorf("must update at least one allocation")
 	}
 
-	// Update modified timestamp for client initiated allocation updates
-	now := time.Now().UTC().UnixNano()
-	for _, alloc := range args.Alloc {
-		alloc.ModifyTime = now
+	// Ensure that evals aren't set from client RPCs
+	// We create them here before the raft update
+	if len(args.Evals) != 0 {
+		return fmt.Errorf("evals field must not be set")
 	}
+
+	// Update modified timestamp for client initiated allocation updates
+	now := time.Now()
+	var evals []*structs.Evaluation
+
+	for _, alloc := range args.Alloc {
+		alloc.ModifyTime = now.UTC().UnixNano()
+
+		// Add an evaluation if this is a failed alloc that is eligible for rescheduling
+		if alloc.ClientStatus == structs.AllocClientStatusFailed {
+			// Only create evaluations if this is an existing alloc,
+			// and eligible as per its task group's ReschedulePolicy
+			if existingAlloc, _ := n.srv.State().AllocByID(nil, alloc.ID); existingAlloc != nil {
+				job, err := n.srv.State().JobByID(nil, existingAlloc.Namespace, existingAlloc.JobID)
+				if err != nil {
+					n.logger.Error("UpdateAlloc unable to find job", "job", existingAlloc.JobID, "error", err)
+					continue
+				}
+				if job == nil {
+					n.logger.Debug("UpdateAlloc unable to find job", "job", existingAlloc.JobID)
+					continue
+				}
+				taskGroup := job.LookupTaskGroup(existingAlloc.TaskGroup)
+				if taskGroup != nil && existingAlloc.FollowupEvalID == "" && existingAlloc.RescheduleEligible(taskGroup.ReschedulePolicy, now) {
+					eval := &structs.Evaluation{
+						ID:          uuid.Generate(),
+						Namespace:   existingAlloc.Namespace,
+						TriggeredBy: structs.EvalTriggerRetryFailedAlloc,
+						JobID:       existingAlloc.JobID,
+						Type:        job.Type,
+						Priority:    job.Priority,
+						Status:      structs.EvalStatusPending,
+					}
+					evals = append(evals, eval)
+				}
+			}
+		}
+	}
+
 	// Add this to the batch
 	n.updatesLock.Lock()
 	n.updates = append(n.updates, args.Alloc...)
+	n.evals = append(n.evals, evals...)
 
 	// Start a new batch if none
 	future := n.updateFuture
 	if future == nil {
-		future = NewBatchFuture()
+		future = structs.NewBatchFuture()
 		n.updateFuture = future
 		n.updateTimer = time.AfterFunc(batchUpdateInterval, func() {
 			// Get the pending updates
 			n.updatesLock.Lock()
 			updates := n.updates
+			evals := n.evals
 			future := n.updateFuture
 			n.updates = nil
+			n.evals = nil
 			n.updateFuture = nil
 			n.updateTimer = nil
 			n.updatesLock.Unlock()
 
 			// Perform the batch update
-			n.batchUpdate(future, updates)
+			n.batchUpdate(future, updates, evals)
 		})
 	}
 	n.updatesLock.Unlock()
@@ -861,10 +1078,29 @@ func (n *Node) UpdateAlloc(args *structs.AllocUpdateRequest, reply *structs.Gene
 }
 
 // batchUpdate is used to update all the allocations
-func (n *Node) batchUpdate(future *batchFuture, updates []*structs.Allocation) {
+func (n *Node) batchUpdate(future *structs.BatchFuture, updates []*structs.Allocation, evals []*structs.Evaluation) {
+	// Group pending evals by jobID to prevent creating unnecessary evals
+	evalsByJobId := make(map[structs.NamespacedID]struct{})
+	var trimmedEvals []*structs.Evaluation
+	for _, eval := range evals {
+		namespacedID := structs.NamespacedID{
+			ID:        eval.JobID,
+			Namespace: eval.Namespace,
+		}
+		_, exists := evalsByJobId[namespacedID]
+		if !exists {
+			trimmedEvals = append(trimmedEvals, eval)
+			evalsByJobId[namespacedID] = struct{}{}
+		}
+	}
+
+	if len(trimmedEvals) > 0 {
+		n.logger.Debug("adding evaluations for rescheduling failed allocations", "num_evals", len(trimmedEvals))
+	}
 	// Prepare the batch update
 	batch := &structs.AllocUpdateRequest{
 		Alloc:        updates,
+		Evals:        trimmedEvals,
 		WriteRequest: structs.WriteRequest{Region: n.srv.config.Region},
 	}
 
@@ -872,7 +1108,7 @@ func (n *Node) batchUpdate(future *batchFuture, updates []*structs.Allocation) {
 	var mErr multierror.Error
 	_, index, err := n.srv.raftApply(structs.AllocClientUpdateRequestType, batch)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: alloc update failed: %v", err)
+		n.logger.Error("alloc update failed", "error", err)
 		mErr.Errors = append(mErr.Errors, err)
 	}
 
@@ -889,7 +1125,7 @@ func (n *Node) batchUpdate(future *batchFuture, updates []*structs.Allocation) {
 		ws := memdb.NewWatchSet()
 		accessors, err := n.srv.State().VaultAccessorsByAlloc(ws, alloc.ID)
 		if err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: looking up accessors for alloc %q failed: %v", alloc.ID, err)
+			n.logger.Error("looking up Vault accessors for alloc failed", "alloc_id", alloc.ID, "error", err)
 			mErr.Errors = append(mErr.Errors, err)
 		}
 
@@ -897,9 +1133,9 @@ func (n *Node) batchUpdate(future *batchFuture, updates []*structs.Allocation) {
 	}
 
 	if l := len(revoke); l != 0 {
-		n.srv.logger.Printf("[DEBUG] nomad.client: revoking %d accessors due to terminal allocations", l)
+		n.logger.Debug("revoking accessors due to terminal allocations", "num_accessors", l)
 		if err := n.srv.vault.RevokeTokens(context.Background(), revoke, true); err != nil {
-			n.srv.logger.Printf("[ERR] nomad.client: batched accessor revocation failed: %v", err)
+			n.logger.Error("batched Vault accessor revocation failed", "error", err)
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
@@ -1064,38 +1300,6 @@ func (n *Node) createNodeEvals(nodeID string, nodeIndex uint64) ([]string, uint6
 	return evalIDs, evalIndex, nil
 }
 
-// batchFuture is used to wait on a batch update to complete
-type batchFuture struct {
-	doneCh chan struct{}
-	err    error
-	index  uint64
-}
-
-// NewBatchFuture creates a new batch future
-func NewBatchFuture() *batchFuture {
-	return &batchFuture{
-		doneCh: make(chan struct{}),
-	}
-}
-
-// Wait is used to block for the future to complete and returns the error
-func (b *batchFuture) Wait() error {
-	<-b.doneCh
-	return b.err
-}
-
-// Index is used to return the index of the batch, only after Wait()
-func (b *batchFuture) Index() uint64 {
-	return b.index
-}
-
-// Respond is used to unblock the future
-func (b *batchFuture) Respond(index uint64, err error) {
-	b.index = index
-	b.err = err
-	close(b.doneCh)
-}
-
 // DeriveVaultToken is used by the clients to request wrapped Vault tokens for
 // tasks
 func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
@@ -1107,8 +1311,15 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 		if e == nil {
 			return
 		}
-		reply.Error = structs.NewRecoverableError(e, recoverable).(*structs.RecoverableError)
-		n.srv.logger.Printf("[ERR] nomad.client: DeriveVaultToken failed (recoverable %v): %v", recoverable, e)
+		re, ok := e.(*structs.RecoverableError)
+		if ok {
+			// No need to wrap if error is already a RecoverableError
+			reply.Error = re
+		} else {
+			reply.Error = structs.NewRecoverableError(e, recoverable).(*structs.RecoverableError)
+		}
+
+		n.logger.Error("DeriveVaultToken failed", "recoverable", recoverable, "error", e)
 	}
 
 	if done, err := n.srv.forward("Node.DeriveVaultToken", args, args, reply); done {
@@ -1233,8 +1444,7 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 
 					secret, err := n.srv.vault.CreateToken(ctx, alloc, task)
 					if err != nil {
-						wrapped := fmt.Sprintf("failed to create token for task %q on alloc %q: %v", task, alloc.ID, err)
-						return structs.WrapRecoverable(wrapped, err)
+						return err
 					}
 
 					results[task] = secret
@@ -1266,10 +1476,6 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 	tokens := make(map[string]string, len(results))
 	for task, secret := range results {
 		w := secret.WrapInfo
-		if w == nil {
-			return fmt.Errorf("Vault returned Secret without WrapInfo")
-		}
-
 		tokens[task] = w.Token
 		accessor := &structs.VaultAccessor{
 			Accessor:    w.WrappedAccessor,
@@ -1284,10 +1490,10 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 
 	// If there was an error revoke the created tokens
 	if createErr != nil {
-		n.srv.logger.Printf("[ERR] nomad.node: Vault token creation for alloc %q failed: %v", alloc.ID, createErr)
+		n.logger.Error("Vault token creation for alloc failed", "alloc_id", alloc.ID, "error", createErr)
 
 		if revokeErr := n.srv.vault.RevokeTokens(context.Background(), accessors, false); revokeErr != nil {
-			n.srv.logger.Printf("[ERR] nomad.node: Vault token revocation for alloc %q failed: %v", alloc.ID, revokeErr)
+			n.logger.Error("Vault token revocation for alloc failed", "alloc_id", alloc.ID, "error", revokeErr)
 		}
 
 		if rerr, ok := createErr.(*structs.RecoverableError); ok {
@@ -1303,7 +1509,7 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 	req := structs.VaultAccessorsRequest{Accessors: accessors}
 	_, index, err := n.srv.raftApply(structs.VaultAccessorRegisterRequestType, &req)
 	if err != nil {
-		n.srv.logger.Printf("[ERR] nomad.client: Register Vault accessors for alloc %q failed: %v", alloc.ID, err)
+		n.logger.Error("registering Vault accessors for alloc failed", "alloc_id", alloc.ID, "error", err)
 
 		// Determine if we can recover from the error
 		retry := false
@@ -1319,5 +1525,30 @@ func (n *Node) DeriveVaultToken(args *structs.DeriveVaultTokenRequest,
 	reply.Index = index
 	reply.Tasks = tokens
 	n.srv.setQueryMeta(&reply.QueryMeta)
+	return nil
+}
+
+func (n *Node) EmitEvents(args *structs.EmitNodeEventsRequest, reply *structs.EmitNodeEventsResponse) error {
+	if done, err := n.srv.forward("Node.EmitEvents", args, args, reply); done {
+		return err
+	}
+	defer metrics.MeasureSince([]string{"nomad", "client", "emit_events"}, time.Now())
+
+	if len(args.NodeEvents) == 0 {
+		return fmt.Errorf("no node events given")
+	}
+	for nodeID, events := range args.NodeEvents {
+		if len(events) == 0 {
+			return fmt.Errorf("no node events given for node %q", nodeID)
+		}
+	}
+
+	_, index, err := n.srv.raftApply(structs.UpsertNodeEventsType, args)
+	if err != nil {
+		n.logger.Error("upserting node events failed", "error", err)
+		return err
+	}
+
+	reply.Index = index
 	return nil
 }
